@@ -1,0 +1,94 @@
+#!/bin/sh
+
+set -eu
+
+# Config
+# ------
+# hooks.verify.keydir
+#   This string specifies the directory inside the repository that contains
+#   all keys that are allowed to sign commits.
+
+refname="$1"
+oldrev="$2"
+newrev="$3"
+
+# --- Safety check
+if [ -z "$GIT_DIR" ]; then
+	echo "Don't run this script from the command line." >&2
+	echo " (if you want, you could supply GIT_DIR then run" >&2
+	echo "  $0 <ref> <oldrev> <newrev>)" >&2
+	exit 1
+fi
+
+if [ -z "$refname" -o -z "$oldrev" -o -z "$newrev" ]; then
+	echo "usage: $0 <ref> <oldrev> <newrev>" >&2
+	exit 1
+fi
+
+zero="0000000000000000000000000000000000000000"
+if [ "$newrev" = "$zero" ]; then
+	echo "Deleting $refname is allowed."
+	exit 0
+fi
+
+# Exclude all already present refs
+excludes="$(git for-each-ref --format '^%(refname)' refs/heads/ refs/tags/ | tr '\n' ' ')"
+
+# Exclude $oldrev if this isn't a new branch
+if [ "$oldrev" != "$zero" ]; then
+	excludes="$excludes ^${oldrev}"
+fi
+
+commits=$(git rev-list $newrev $excludes 2>/dev/null)
+if ! keydir=$(git config --get hooks.verify.keydir); then
+	echo "error: A key directory must be specified in the git" >&2
+	echo "configuration variable hooks.verify.keydir." >&2
+	exit 1
+fi
+
+if ! git config --get gpg.program; then
+	git config --local gpg.program $(readlink -e ${GIT_DIR}/hooks/gpg-wrapper.sh)
+fi
+
+for commit in $commits; do
+	echo "Verifying $(git show -s --oneline $commit ):"
+	# Find parent commit
+	if ! parent=$(git rev-parse --quiet --verify "${commit}^^{commit}"); then
+		echo "No parent commit present" >&2
+		exit 1
+	fi
+	if [ "$(git cat-file -t ${parent}:${keydir} 2>/dev/null)" != "tree" ]; then
+		echo "No key file directory $keydir present in parent commit:" >&2
+		git show -s --oneline $parent >&2
+		exit 1
+	fi
+	# Import all keys from $keydir into a temporary GPG home
+	if ! GNUPGHOME=$(mktemp -d); then
+		echo "Could not create temporary key directory" >&2
+		exit 1
+	fi
+	export GNUPGHOME
+	for key in $(git ls-tree --full-tree --name-only -r $parent $keydir); do
+		if ! git cat-file blob $parent:$key | gpg --batch --quiet --import 2>/dev/null; then
+			echo "Warning: Could not import $key. Is it a valid PGP key?" >&2
+		fi
+	done
+	if $(git verify-commit $commit 2>&1); then
+		success=true
+	else
+		success=false
+		keys="$(gpg --list-keys)"
+	fi
+	rm -rf "$GNUPGHOME"
+	if [ "$success" = true ]; then
+		echo "OK"
+	else
+		echo "Verification failed with keys from parent commit:"
+		git show -s --oneline $parent >&2
+		echo "Tried the following keys:"
+		echo "$keys"
+		exit 1
+	fi
+done
+
+exit 0
