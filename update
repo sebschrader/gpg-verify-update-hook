@@ -1,94 +1,210 @@
 #!/bin/sh
 
-set -eu
-
 # Config
 # ------
 # hooks.verify.keydir
 #   This string specifies the directory inside the repository that contains
 #   all keys that are allowed to sign commits.
+# gpg.program
+#   See git-config(1) man page.
 
-refname="$1"
-oldrev="$2"
-newrev="$3"
+set -e
 
-# --- Safety check
-if [ -z "$GIT_DIR" ]; then
-	echo "Don't run this script from the command line." >&2
-	echo " (if you want, you could supply GIT_DIR then run" >&2
-	echo "  $0 <ref> <oldrev> <newrev>)" >&2
-	exit 1
-fi
+msg () {
+	echo $msg_prefix$@ >&2
+}
 
-if [ -z "$refname" -o -z "$oldrev" -o -z "$newrev" ]; then
-	echo "usage: $0 <ref> <oldrev> <newrev>" >&2
-	exit 1
-fi
+# Detach the GPG signature from git commit object.
+# Outputs the payload to fd 3 and the signature to fd 4.
+# If no signature was found a non-zero code is returned.
+detach_signature() {
+	in_signature=false
+	saw_signature=false
+	while IFS= read -r line; do
+		case "$line" in
+			'gpgsig '*)
+				printf '%s\n' "${line#gpgsig }" >&4
+				in_signature=true
+				saw_signature=true
+				;;
+			' '*)
+				if [ "$in_signature" = true ]; then
+					printf '%s\n' "${line# }" >&4
+				else
+					printf '%s\n' "$line" >&3
+				fi
+				;;
+			*)
+				if [ "$in_signature" = true ]; then
+					in_signature=false
+			 fi
+			  printf '%s\n' "$line" >&3
+			 ;;
+		esac
+	done
+	# Trailing content from read after last newline
+	printf '%s' "$line" >&3
+	[ "$saw_signature" = true ] || return 1
+}
 
-zero="0000000000000000000000000000000000000000"
-if [ "$newrev" = "$zero" ]; then
-	echo "Deleting $refname is allowed."
-	exit 0
-fi
+# Parse the GPG status output.
+# Returns a non-zero code, if GPG reports any signature errors occur or no
+# good signature is found.
+check_gpg_status() {
+	rc=1
+	while read -r prefix type keyid f2 f3 f4 f5 f6; do
+		[ "$prefix" = '[GNUPG:]' ] || continue
+		case "$type" in
+			'GOODSIG')
+				rc=0;;
+			'EXPSIG')
+				msg "Expired signature from \"$f2\" keyid $keyid"
+				return 1;;
+			'EXPKEYSIG')
+				msg "Expired key signature from \"$f2\" keyid $keyid"
+				return 1;;
+			'REVKEYSIG')
+				msg "Revoked key signature from \"$f2\" keyid $keyid"
+				return 1;;
+			'BADSIG')
+				msg "Bad signature from \"$f2\" keyid $keyid"
+				return 1;;
+			'ERRSIG')
+				msg 'Signature verification error'
+				if [ "$f6" = 9 ]; then
+					msg "No public key with keyid $keyid"
+				fi
+				return 1;;
+		esac
+	done
+	return $rc
+}
 
-# Exclude all already present refs
-excludes="$(git for-each-ref --format '^%(refname)' refs/heads/ refs/tags/ | tr '\n' ' ')"
+# Get all parent commits of a commit
+get_parent_commits () {
+	commit=$1
+	git rev-list -n 1 --parents "$commit" | ( read -r child parents; echo "$parents" )
+}
 
-# Exclude $oldrev if this isn't a new branch
-if [ "$oldrev" != "$zero" ]; then
-	excludes="$excludes ^${oldrev}"
-fi
+# Verify a commit with the keys found in its parent.
+# Return a non-zero code if the commit could successfully be verified.
+#
+# The commit verification is implemented in the shell, because
+# git-verify-commit(1) was only introduced in git 2.1.0
+verify_commit () {
+	commit=$1
+	parent=$2
+	msg "Trying parent commit $(git show -s --oneline $parent)"
 
-commits=$(git rev-list $newrev $excludes 2>/dev/null)
-if ! keydir=$(git config --get hooks.verify.keydir); then
-	echo "error: A key directory must be specified in the git" >&2
-	echo "configuration variable hooks.verify.keydir." >&2
-	exit 1
-fi
-
-if ! git config --get gpg.program; then
-	git config --local gpg.program $(readlink -e ${GIT_DIR}/hooks/gpg-wrapper.sh)
-fi
-
-for commit in $commits; do
-	echo "Verifying $(git show -s --oneline $commit ):"
-	# Find parent commit
-	if ! parent=$(git rev-parse --quiet --verify "${commit}^^{commit}"); then
-		echo "No parent commit present" >&2
-		exit 1
-	fi
 	if [ "$(git cat-file -t ${parent}:${keydir} 2>/dev/null)" != "tree" ]; then
-		echo "No key file directory $keydir present in parent commit:" >&2
-		git show -s --oneline $parent >&2
-		exit 1
+		msg 'warn: no key directory found.'
+		msg 'A key directory can be specified in the hooks.verify.keydir'
+		msg 'git configuration variable, the default is "keys"'
+		return 1
 	fi
-	# Import all keys from $keydir into a temporary GPG home
-	if ! GNUPGHOME=$(mktemp -d); then
-		echo "Could not create temporary key directory" >&2
-		exit 1
-	fi
-	export GNUPGHOME
+
+	# Clear the keyring
+	true > $keyring
+	# Import all keys from $keydir into the keyring
 	for key in $(git ls-tree --full-tree --name-only -r $parent $keydir); do
-		if ! git cat-file blob $parent:$key | gpg --batch --quiet --import 2>/dev/null; then
-			echo "Warning: Could not import $key. Is it a valid PGP key?" >&2
+		if ! git cat-file blob $parent:$key | $gpg --import; then
+			msg "Warning: Could not import $key. Is it a valid PGP key?"
 		fi
 	done
-	if $(git verify-commit $commit 2>&1); then
-		success=true
-	else
-		success=false
-		keys="$(gpg --list-keys)"
-	fi
-	rm -rf "$GNUPGHOME"
-	if [ "$success" = true ]; then
-		echo "OK"
-	else
-		echo "Verification failed with keys from parent commit:"
-		git show -s --oneline $parent >&2
-		echo "Tried the following keys:"
-		echo "$keys"
+
+	$gpg --status-fd=1 --verify "$signature" - < "$payload" 2>/dev/null | check_gpg_status || {
+		msg 'Verification failed.'
+		return 1
+	}
+	msg 'Verification successful.'
+	return 0
+}
+
+main () {
+	if [ "$#" -lt 3 ]; then
+		msg "usage: $0 <ref> <oldrev> <newrev>"
 		exit 1
 	fi
-done
 
-exit 0
+	# --- Safety check
+	if [ -z "$GIT_DIR" ]; then
+		msg "Don't run this script from the command line."
+		msg " (if you want, you could supply GIT_DIR then run"
+		msg "  $0 <ref> <oldrev> <newrev>)"
+		exit 1
+	fi
+
+	refname="$1"
+	oldrev="$2"
+	newrev="$3"
+
+	zero="0000000000000000000000000000000000000000"
+	if [ "$newrev" = "$zero" ]; then
+		msg "info: Deletion of ${refname}. No verification is performed."
+		exit 0
+	fi
+
+	tempdir=$(mktemp -d) || {
+		msg "Could not create temporary directory"
+		exit 1
+	}
+	trap 'rm -rf "$tempdir"' EXIT INT TERM HUP
+
+	if ! keydir=$(git config --get hooks.verify.keydir); then
+		keydir=keys
+	fi
+
+	keyring="$tempdir/trusted.gpg"
+	payload="$tempdir/payload"
+	signature="$tempdir/signature"
+	gpgopts="--quiet --no-options --no-default-keyring --homedir $tempdir \
+		--no-auto-check-trustdb --trust-model always --keyring $keyring \
+		--primary-keyring $keyring"
+	if ! gpg=$(git config --get gpg.program); then
+		gpg=gpg
+	fi
+	gpg="$gpg $gpgopts"
+
+	# Exclude all already present refs if this is a new ref
+	if [ "$oldrev" = "$zero" ]; then
+		excludes="$(git for-each-ref --format '^%(refname)' refs/heads/ refs/tags/ | tr '\n' ' ')"
+	# Exclude $oldrev if this isn't a new ref
+	else
+		excludes="^${oldrev}"
+	fi
+
+	commits=$(git rev-list $newrev $excludes 2>/dev/null)
+	for commit in $commits; do
+		msg "Verifying commit $(git show -s --oneline $commit )"
+		git cat-file commit "$commit" | detach_signature 3>$payload 4>$signature || {
+			msg 'error: commit is not signed'
+			exit 1
+		}
+		parents=$(get_parent_commits $commit)
+		# Find parent commits
+		if [ -z "$parents" ]; then
+			msg 'error: commit has no parents'
+			msg 'You must initialize the git repository with a trusted first'
+			msg 'commit containing a key directory before enabling this hook.'
+			exit 1
+		fi
+		success=0
+		msg_prefix='-> '
+		for parent in $parents; do
+			if verify_commit $commit $parent; then
+				success=1
+				break
+			fi
+		done
+		msg_prefix=
+
+		if [ "$success" -eq 0 ]; then
+			msg "error: No parent commit could verify $(git show -s --oneline $commit)"
+			exit 1
+		fi
+	done
+
+	exit 0
+}
+
+main $@
